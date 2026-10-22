@@ -1,0 +1,89 @@
+--' The seqqc test suite, against a Python oracle
+--'
+--' Runs against whichever implementation module is imported alongside it.
+--' Reports are compared with an independent Python oracle on generated reads
+--' small enough that every summary is exact.
+module seqqc.test (test)
+
+import root
+import bio
+import seqqc
+import parallel
+import unittest
+
+record Py => QcReport = "dict"
+
+source Py from "seqqc-test.py"
+  ( "tmp_path" as tmpPath
+  , "make_reads" as makeReads
+  , "check" as checkReport
+  , "check_fastqc_data" as checkFastqcData
+  )
+
+tmpPath :: Str -> <IO> Str
+makeReads :: Str -> Int -> Int -> <IO> ()
+checkReport :: Str -> QcReport -> <IO> Str
+checkFastqcData :: Str -> Str -> <IO> Str
+
+same :: a -> a
+same x = x
+
+testReport :: Results -> <IO> Results
+testReport s0 = do
+  p <- tmpPath "reads.fq"
+  makeReads p 20000 3
+  ingest readFastq 0 p (p <> ".mlc")
+  Ok s <- @open (p <> ".mlc")
+  Ok streamed <- reduce readQc mergeReadQc qcReport (@next s)
+  Ok s2 <- @open (p <> ".mlc")
+  Ok chunked <- psreduceWith (.(.chunking = FixedChunks, .chunkSize = 700) defaultParOpts) readQc mergeReadQc qcReport (@next s2)
+  all <- collectSource (loadSource (p <> ".mlc"))
+  whole <- checkReport p (qcReport (readQc all))
+  msg <- checkReport p streamed
+  cmsg <- checkReport p chunked
+  e <- tmpPath "empty.fq"
+  makeReads e 0 1
+  ( testEqual "a report over stream batches matches the oracle" msg ""
+  . testEqual "a report over small parallel chunks matches the oracle" cmsg ""
+  . testEqual "a report over one batch matches the oracle" whole ""
+  . testEqual "the empty summary reports no reads" (.reads (qcReport (readQc []))) 0
+  . testEqual "merging the empty summary changes nothing"
+      (.distinct (qcReport (mergeReadQc (readQc []) (readQc all))))
+      (.distinct (qcReport (readQc all)))
+  ) s0
+
+testPairs :: Results -> <IO> Results
+testPairs s0 = do
+  p <- tmpPath "m1.fq"
+  q <- tmpPath "m2.fq"
+  makeReads p 3000 5
+  makeReads q 3000 6
+  ingestFastqPairs 0 p q (p <> ".mlc")
+  Ok s <- @open (p <> ".mlc")
+  Ok r <- reduce pairQc mergePairQc pairQcReport (@next s)
+  m1 <- checkReport p (.0 r)
+  m2 <- checkReport q (.1 r)
+  ( testEqual "first mates of pairs match the oracle" m1 ""
+  . testEqual "second mates of pairs match the oracle" m2 ""
+  ) s0
+
+testFastqcData :: Results -> <IO> Results
+testFastqcData s0 = do
+  p <- tmpPath "fqc.fq"
+  makeReads p 5000 7
+  ingest readFastq 0 p (p <> ".mlc")
+  q <- collectSource (loadSource (p <> ".mlc"))
+  msg <- checkFastqcData p (fastqcData "fqc.fq" (readQc q))
+  empty <- checkFastqcData p (fastqcData "x" (readQc []))
+  ( testEqual "fastqc_data.txt has FastQC's modules and the oracle's numbers" msg ""
+  . testEqual "an empty summary still formats (and differs from the oracle)" (empty == "") False
+  ) s0
+
+test :: <IO> Bool
+test = suiteE runTests
+
+runTests :: Results -> <IO> Results
+runTests s0 = do
+  s1 <- groupE "Single reads" testReport s0
+  s2 <- groupE "Pairs" testPairs s1
+  groupE "FastQC report" testFastqcData s2

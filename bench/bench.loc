@@ -1,0 +1,35 @@
+--' seqqc-rust commands timed by run.sh
+module seqqc-bench
+  ( ingestFastqPairs
+  , qcMlc
+  , qcFastq
+  )
+
+import bio
+import seqqc
+import seqqc-rust
+
+--' Read statistics of a stream file of pairs
+--'
+--' Returns the total reads of both mates.
+qcMlc ::
+  --' Stream file of read pairs
+  Str ->
+  <IO> Int
+qcMlc path = do
+  Ok s <- @open path
+  Ok r <- reduce pairQc mergePairQc pairQcReport (@next s)
+  .reads (.0 r) + .reads (.1 r)
+
+--' Read statistics of paired FASTQ text
+--'
+--' Returns the total reads of both mates.
+qcFastq ::
+  --' First-mate FASTQ file
+  Str ->
+  --' Second-mate FASTQ file
+  Str ->
+  <IO> Int
+qcFastq r1 r2 = do
+  q <- foldSource (\acc xs -> mergePairQc acc (pairQc xs)) (pairQc []) (readFastqPairs r1 r2)
+  .reads (qcReport (.first q)) + .reads (qcReport (.second q))

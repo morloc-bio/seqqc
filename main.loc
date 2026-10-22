@@ -1,0 +1,192 @@
+--' Read quality statistics as FastQC computes them, as mergeable summaries
+--'
+--' A batch of reads becomes a `ReadQc`, two summaries merge with
+--' `mergeReadQc` in stream order, and `qcReport` turns the final summary into
+--' the numbers FastQC reports. `readQc []` is the identity, so these plug into
+--' `reduce` directly:
+--'
+--'   reduce pairQc mergePairQc pairQcReport (@next reads)
+--'
+--' Two FastQC modules are not mergeable as FastQC defines them (they follow
+--' the first 100k distinct sequences in file order) and are replaced:
+--'
+--' * Duplication: a bottom-k sketch of distinct sequences by hash (FNV-1a 64
+--'   of the first 50 bases): every distinct sequence is equally likely to be
+--'   kept, and a kept sequence's count is exact. Merging keeps the k smallest
+--'   hashes of the union, which is the sketch of the whole stream.
+--' * Overrepresented sequences: a Misra-Gries summary of the first 50 bases
+--'   with `heavyCapacity` (100k, FastQC's cutoff) counters. Counts are exact
+--'   while there are no more distinct sequences than counters, whatever the
+--'   chunking; past that, every sequence above reads/capacity is kept and a
+--'   kept count undercounts by at most `heavyError`.
+module seqqc
+  ( ReadQc
+  , PairQc
+  , QcReport
+  , qualBins
+  , adapterNames
+  , readQc
+  , pairQc
+  , mergeReadQc
+  , mergePairQc
+  , qcReport
+  , pairQcReport
+  , fastqcData
+  )
+
+import root
+import bio
+
+--' Number of phred score bins
+--'
+--' Scores are binned 0..41; higher scores fall in the last bin.
+qualBins :: Int
+qualBins = 42
+
+--' Names of the adapters searched for, in search order
+--'
+--' Illumina universal, Nextera, small RNA 3', poly-A.
+adapterNames :: [Str]
+adapterNames =
+  [ "Illumina Universal Adapter"
+  , "Nextera Transposase Sequence"
+  , "Illumina Small RNA 3' Adapter"
+  , "PolyA"
+  ]
+
+--' A mergeable summary of a set of reads
+record ReadQc where
+  --' Reads seen
+  reads :: Int
+  --' Bases seen
+  bases :: Int
+  --' Reads by length
+  --'
+  --' Index = length; the last bin holds longer reads.
+  lengths :: [Int]
+  --' Counts of phred scores per position
+  --'
+  --' Position-major: `qualBins` counts per position.
+  posQuals :: [Int]
+  --' Counts of A, C, G, T, N per position, position-major
+  posBases :: [Int]
+  --' Reads by GC percent, 0..100
+  gc :: [Int]
+  --' Reads by mean phred, 0..41
+  meanQuals :: [Int]
+  --' Reads by where each adapter's prefix first starts
+  --'
+  --' Position-major, one count per adapter: reads in which the adapter's
+  --' 12-base prefix first starts at this position.
+  adapterStarts :: [Int]
+  --' Bottom-k sketch of distinct sequences
+  --'
+  --' (hash, count) of the distinct sequences with the smallest hashes,
+  --' ascending by hash.
+  dupSketch :: [(Int, Int)]
+  --' Most distinct sequences the sketch keeps
+  dupCapacity :: Int
+  --' Misra-Gries counters: (first 50 bases, count)
+  heavy :: [(Str, Int)]
+  --' Most counters the Misra-Gries summary keeps
+  heavyCapacity :: Int
+  --' Total decrement applied to the counters
+  --'
+  --' An upper bound on any count's undercount.
+  heavyError :: Int
+
+--' Summaries of the two mates of a set of pairs
+record PairQc where
+  --' Summary of the first mates
+  first :: ReadQc
+  --' Summary of the second mates
+  second :: ReadQc
+
+--' The summary of a batch of reads
+readQc :: [FastqEntry] -> ReadQc
+
+--' The summary of a batch of pairs, mate by mate
+pairQc :: [ReadPair] -> PairQc
+
+--' Merge two read summaries, in stream order
+mergeReadQc :: ReadQc -> ReadQc -> ReadQc
+
+--' Merge two pair summaries, in stream order
+mergePairQc :: PairQc -> PairQc -> PairQc
+mergePairQc a b = {first = mergeReadQc (.first a) (.first b), second = mergeReadQc (.second a) (.second b)}
+
+--' What FastQC reports, from a summary
+record QcReport where
+  --' Reads seen
+  reads :: Int
+  --' Bases seen
+  bases :: Int
+  --' Shortest read length
+  minLength :: Int
+  --' Longest read length
+  maxLength :: Int
+  --' Mean read length
+  meanLength :: Real
+  --' Mean GC fraction of the reads, as a percent
+  gcPercent :: Real
+  --' Mean phred over all bases
+  meanQuality :: Real
+  --' Mean phred at each position
+  positionQuality :: [Real]
+  --' Percent of reads with N at each position
+  positionN :: [Real]
+  --' Estimated distinct sequences
+  distinct :: Int
+  --' Percent of reads that would remain after removing duplicates
+  --'
+  --' FastQC's "total deduplicated".
+  dedupPercent :: Real
+  --' Percent of distinct sequences seen 1..9 and >=10 times
+  --'
+  --' Over the sketched distinct sequences.
+  duplicationLevels :: [Real]
+  --' Sequences that may lie above 0.1% of reads
+  --'
+  --' (first 50 bases, count, percent). A count is a lower bound; the true
+  --' count is at most `overrepresentedError` more.
+  overrepresented :: [(Str, Int, Real)]
+  --' Most any overrepresented count may be undercounted by
+  overrepresentedError :: Int
+  --' Percent of reads containing each adapter by each position
+  --'
+  --' Per adapter, the percent of reads that contain it at or before each
+  --' position.
+  adapterContent :: [[Real]]
+
+--' FastQC's report numbers from a read summary
+qcReport :: ReadQc -> QcReport
+
+--' FastQC's report numbers for each mate of a pair summary
+pairQcReport :: PairQc -> (QcReport, QcReport)
+pairQcReport x = (qcReport (.first x), qcReport (.second x))
+
+--' FastQC 0.12.1's fastqc_data.txt for a read summary
+--'
+--' Uses FastQC's default pass/warn/fail limits with positions ungrouped
+--' (FastQC's --nogroup). MultiQC reads it as a FastQC report. Duplication
+--' levels come from the sketch, and overrepresented sequences have "No Hit"
+--' as their source (no contaminant list is searched).
+fastqcData ::
+  --' Name of the file the reads came from
+  Str ->
+  ReadQc ->
+  Str
+
+-- Summaries as monoids, for `<>` and `mempty`.
+
+instance Semigroup ReadQc where
+  (<>) a b = mergeReadQc a b
+
+instance Monoid ReadQc where
+  mempty = readQc []
+
+instance Semigroup PairQc where
+  (<>) a b = mergePairQc a b
+
+instance Monoid PairQc where
+  mempty = pairQc []

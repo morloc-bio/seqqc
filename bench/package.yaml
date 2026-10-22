@@ -1,0 +1,7 @@
+name: seqqc-bench
+version: 0.1.0
+synopsis: Benchmarks of seqqc
+description: Times seqqc against FastQC 0.12.1, the version nf-core/rnaseq 3.27.0 pins.
+license: MIT
+tool-deps:
+  fastqc: { version: "==0.12.1", channel: "bioconda" }
